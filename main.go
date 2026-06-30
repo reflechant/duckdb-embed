@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"database/sql"
+	"database/sql/driver"
 	"embed"
 	"encoding/csv"
 	"encoding/json"
@@ -17,7 +19,7 @@ import (
 	"strings"
 	"time"
 
-	_ "github.com/duckdb/duckdb-go/v2"
+	"github.com/duckdb/duckdb-go/v2"
 	"github.com/google/uuid"
 	"github.com/jung-kurt/gofpdf/v2"
 	"github.com/xuri/excelize/v2"
@@ -96,36 +98,49 @@ func generateData(db *sql.DB, rows int) {
 	statuses := []string{"SUCCESS", "ERROR", "PENDING", "TIMEOUT"}
 	categories := []string{"API", "Database", "Cache", "Worker", "Auth"}
 	
-	// Prepare statement for faster inserts
-	stmt, err := db.Prepare(`
-		INSERT INTO metrics (id, req_id, status, created_at, duration_ms, is_active, category, metadata)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`)
+	conn, err := db.Conn(context.Background())
 	if err != nil {
-		log.Fatalf("Failed to prepare statement: %v", err)
+		log.Fatalf("Failed to get DB connection: %v", err)
 	}
-	defer stmt.Close()
+	defer conn.Close()
 
 	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
 	now := time.Now()
 
-	for i := 1; i <= rows; i++ {
-		reqID := uuid.New().String()
-		status := statuses[rnd.Intn(len(statuses))]
-		createdAt := now.Add(-time.Duration(rnd.Intn(10000)) * time.Minute)
-		durationMs := rnd.Float64() * 1500.0
-		if status == "TIMEOUT" {
-			durationMs = 5000.0 + rnd.Float64()*1000.0
-		}
-		isActive := rnd.Intn(10) > 2 // 70% active
-		category := categories[rnd.Intn(len(categories))]
-		
-		metadataJSON := fmt.Sprintf(`{"region": "us-east-1", "retries": %d, "version": "v1.%d"}`, rnd.Intn(5), rnd.Intn(10))
-
-		_, err := stmt.Exec(i, reqID, status, createdAt, durationMs, isActive, category, metadataJSON)
+	err = conn.Raw(func(driverConn interface{}) error {
+		appender, err := duckdb.NewAppenderFromConn(driverConn.(driver.Conn), "", "metrics")
 		if err != nil {
-			log.Fatalf("Failed to insert row %d: %v", i, err)
+			return fmt.Errorf("failed to create appender: %w", err)
 		}
+		defer appender.Close()
+
+		for i := 1; i <= rows; i++ {
+			reqID := uuid.New().String()
+			status := statuses[rnd.Intn(len(statuses))]
+			createdAt := now.Add(-time.Duration(rnd.Intn(10000)) * time.Minute)
+			durationMs := rnd.Float64() * 1500.0
+			if status == "TIMEOUT" {
+				durationMs = 5000.0 + rnd.Float64()*1000.0
+			}
+			isActive := rnd.Intn(10) > 2 // 70% active
+			category := categories[rnd.Intn(len(categories))]
+			
+			metadataJSON := fmt.Sprintf(`{"region": "us-east-1", "retries": %d, "version": "v1.%d"}`, rnd.Intn(5), rnd.Intn(10))
+
+			err = appender.AppendRow(i, reqID, status, createdAt, durationMs, isActive, category, metadataJSON)
+			if err != nil {
+				return fmt.Errorf("failed to append row %d: %w", i, err)
+			}
+		}
+
+		if err := appender.Flush(); err != nil {
+			return fmt.Errorf("failed to flush appender: %w", err)
+		}
+		return nil
+	})
+
+	if err != nil {
+		log.Fatalf("Failed to generate data: %v", err)
 	}
 }
 
