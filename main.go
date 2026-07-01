@@ -28,8 +28,16 @@ import (
 //go:embed static/*
 var staticFiles embed.FS
 
+type ColumnDef struct {
+	Name string `json:"name"`
+	Type string `json:"type"`
+}
+
+var tableColumns []ColumnDef
+
 func main() {
 	port := flag.Int("port", 8080, "Port to serve the application on")
+	dataFile := flag.String("data", "", "Path to JSON file to load into DuckDB")
 	flag.Parse()
 
 	// Initialize in-memory DuckDB
@@ -40,12 +48,19 @@ func main() {
 	defer db.Close()
 
 	log.Println("Initializing database schema...")
-	setupDatabase(db)
+	setupDatabase(db, *dataFile)
 
-	log.Println("Generating mock data...")
-	generateData(db, 5000)
+	// Fetch dynamic schema
+	tableColumns = fetchSchema(db)
+	if len(tableColumns) == 0 {
+		log.Fatalf("No columns found in the metrics table. Database initialization might have failed.")
+	}
 
 	// Setup HTTP routes
+	http.HandleFunc("/api/schema", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(tableColumns)
+	})
 	http.HandleFunc("/api/data", func(w http.ResponseWriter, r *http.Request) {
 		handleAPIData(w, r, db)
 	})
@@ -76,22 +91,56 @@ func main() {
 	}
 }
 
-func setupDatabase(db *sql.DB) {
-	query := `
-	CREATE TABLE metrics (
-		id INTEGER PRIMARY KEY,
-		req_id VARCHAR,
-		status VARCHAR,
-		created_at TIMESTAMP,
-		duration_ms DOUBLE,
-		is_active BOOLEAN,
-		category VARCHAR,
-		metadata JSON
-	)
-	`
-	if _, err := db.Exec(query); err != nil {
-		log.Fatalf("Failed to create table: %v", err)
+func setupDatabase(db *sql.DB, dataFile string) {
+	if dataFile != "" {
+		log.Printf("Loading data from JSON file: %s", dataFile)
+		// Try using read_json_auto
+		query := fmt.Sprintf("CREATE TABLE metrics AS SELECT * FROM read_json_auto('%s')", dataFile)
+		if _, err := db.Exec(query); err != nil {
+			log.Fatalf("Failed to create table from JSON: %v", err)
+		}
+	} else {
+		log.Println("No JSON file provided. Generating mock data...")
+		query := `
+		CREATE TABLE metrics (
+			id INTEGER PRIMARY KEY,
+			req_id VARCHAR,
+			status VARCHAR,
+			created_at TIMESTAMP,
+			duration_ms DOUBLE,
+			is_active BOOLEAN,
+			category VARCHAR,
+			metadata JSON
+		)
+		`
+		if _, err := db.Exec(query); err != nil {
+			log.Fatalf("Failed to create table: %v", err)
+		}
+		generateData(db, 5000)
 	}
+}
+
+func fetchSchema(db *sql.DB) []ColumnDef {
+	rows, err := db.Query("PRAGMA table_info('metrics')")
+	if err != nil {
+		log.Fatalf("Failed to get table schema: %v", err)
+	}
+	defer rows.Close()
+
+	var columns []ColumnDef
+	for rows.Next() {
+		var cid int
+		var name string
+		var typ string
+		var notnull bool
+		var dflt_value interface{}
+		var pk bool
+		if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt_value, &pk); err != nil {
+			log.Fatalf("Failed to scan PRAGMA table_info: %v", err)
+		}
+		columns = append(columns, ColumnDef{Name: name, Type: typ})
+	}
+	return columns
 }
 
 func generateData(db *sql.DB, rows int) {
@@ -144,29 +193,26 @@ func generateData(db *sql.DB, rows int) {
 	}
 }
 
-// Helper function to build WHERE clause for global search
+// Helper function to build WHERE clause for global search dynamically
 func buildSearchQuery(searchVal string) (string, []interface{}) {
 	if searchVal == "" {
 		return "", nil
 	}
 	searchPattern := "%" + searchVal + "%"
-	whereClause := `
-		CAST(id AS VARCHAR) LIKE ? OR
-		req_id LIKE ? OR
-		status LIKE ? OR
-		CAST(created_at AS VARCHAR) LIKE ? OR
-		CAST(duration_ms AS VARCHAR) LIKE ? OR
-		category LIKE ? OR
-		CAST(metadata AS VARCHAR) LIKE ?
-	`
-	whereArgs := make([]interface{}, 7)
-	for i := range whereArgs {
-		whereArgs[i] = searchPattern
+	var clauses []string
+	var args []interface{}
+
+	for _, col := range tableColumns {
+		// Use TRY_CAST or CAST to VARCHAR for all columns
+		clauses = append(clauses, fmt.Sprintf("CAST(%s AS VARCHAR) LIKE ?", col.Name))
+		args = append(args, searchPattern)
 	}
-	return whereClause, whereArgs
+
+	whereClause := strings.Join(clauses, " OR ")
+	return whereClause, args
 }
 
-// Helper function to parse sorting columns
+// Helper function to parse sorting columns dynamically
 func buildOrderQuery(r *http.Request) string {
 	var orderClauses []string
 	for i := 0; ; i++ {
@@ -175,7 +221,7 @@ func buildOrderQuery(r *http.Request) string {
 			break
 		}
 		colIdx, err := strconv.Atoi(colIdxStr)
-		if err != nil {
+		if err != nil || colIdx < 0 || colIdx >= len(tableColumns) {
 			break
 		}
 		dir := r.FormValue(fmt.Sprintf("order[%d][dir]", i))
@@ -184,35 +230,17 @@ func buildOrderQuery(r *http.Request) string {
 			dir = "ASC"
 		}
 
-		colName := ""
-		switch colIdx {
-		case 0:
-			colName = "id"
-		case 1:
-			colName = "req_id"
-		case 2:
-			colName = "status"
-		case 3:
-			colName = "created_at"
-		case 4:
-			colName = "duration_ms"
-		case 5:
-			colName = "is_active"
-		case 6:
-			colName = "category"
-		case 7:
-			colName = "metadata"
-		}
-
-		if colName != "" {
-			orderClauses = append(orderClauses, fmt.Sprintf("%s %s", colName, dir))
-		}
+		colName := tableColumns[colIdx].Name
+		orderClauses = append(orderClauses, fmt.Sprintf("%s %s", colName, dir))
 	}
 
 	if len(orderClauses) > 0 {
 		return strings.Join(orderClauses, ", ")
 	}
-	return "created_at DESC" // default sort
+	if len(tableColumns) > 0 {
+		return tableColumns[0].Name + " DESC" // default sort by first column if no order
+	}
+	return ""
 }
 
 func handleAPIData(w http.ResponseWriter, r *http.Request, db *sql.DB) {
@@ -260,15 +288,14 @@ func handleAPIData(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	// 4. Parse sorting (multi-column sorting)
 	orderBy := buildOrderQuery(r)
 
-	// 5. Query actual page data
-	query := `
-		SELECT id, req_id, status, created_at, duration_ms, is_active, category, CAST(metadata AS VARCHAR)
-		FROM metrics
-	`
+	// 5. Query actual page data dynamically
+	query := "SELECT * FROM metrics"
 	if whereClause != "" {
 		query += " WHERE " + whereClause
 	}
-	query += " ORDER BY " + orderBy
+	if orderBy != "" {
+		query += " ORDER BY " + orderBy
+	}
 
 	var rows *sql.Rows
 	var qErr error
@@ -285,27 +312,37 @@ func handleAPIData(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	}
 	defer rows.Close()
 
-	type Metric struct {
-		ID         int     `json:"id"`
-		ReqID      string  `json:"req_id"`
-		Status     string  `json:"status"`
-		CreatedAt  string  `json:"created_at"`
-		DurationMs float64 `json:"duration_ms"`
-		IsActive   bool    `json:"is_active"`
-		Category   string  `json:"category"`
-		Metadata   string  `json:"metadata"`
+	cols, err := rows.Columns()
+	if err != nil {
+		sendJSONError(w, draw, fmt.Sprintf("Failed to get columns: %v", err))
+		return
 	}
 
-	var results []Metric
+	var results []map[string]interface{}
 	for rows.Next() {
-		var m Metric
-		var t time.Time
-		if err := rows.Scan(&m.ID, &m.ReqID, &m.Status, &t, &m.DurationMs, &m.IsActive, &m.Category, &m.Metadata); err != nil {
+		columnPointers := make([]interface{}, len(cols))
+		columnValues := make([]interface{}, len(cols))
+		for i := range columnValues {
+			columnPointers[i] = &columnValues[i]
+		}
+
+		if err := rows.Scan(columnPointers...); err != nil {
 			sendJSONError(w, draw, fmt.Sprintf("Row scan error: %v", err))
 			return
 		}
-		m.CreatedAt = t.Format(time.RFC3339)
-		results = append(results, m)
+
+		rowMap := make(map[string]interface{})
+		for i, colName := range cols {
+			val := columnValues[i]
+			if b, ok := val.([]byte); ok {
+				rowMap[colName] = string(b)
+			} else if t, ok := val.(time.Time); ok {
+				rowMap[colName] = t.Format(time.RFC3339)
+			} else {
+				rowMap[colName] = val
+			}
+		}
+		results = append(results, rowMap)
 	}
 
 	// DataTables SSP JSON format
@@ -331,8 +368,7 @@ func handleAPIExport(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	if format == "" {
 		format = "csv"
 	}
-	log.Printf("API Export Request: format=%q, search=%q, order_col=%q, order_dir=%q", format, searchVal, r.FormValue("order[0][column]"), r.FormValue("order[0][dir]"))
-
+	
 	// 1. Build filter conditions
 	whereClause, whereArgs := buildSearchQuery(searchVal)
 
@@ -340,14 +376,13 @@ func handleAPIExport(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	orderBy := buildOrderQuery(r)
 
 	// 3. Query all filtered & sorted records (no LIMIT/OFFSET for export)
-	query := `
-		SELECT id, req_id, status, created_at, duration_ms, is_active, category, CAST(metadata AS VARCHAR)
-		FROM metrics
-	`
+	query := "SELECT * FROM metrics"
 	if whereClause != "" {
 		query += " WHERE " + whereClause
 	}
-	query += " ORDER BY " + orderBy
+	if orderBy != "" {
+		query += " ORDER BY " + orderBy
+	}
 
 	rows, err := db.Query(query, whereArgs...)
 	if err != nil {
@@ -370,6 +405,46 @@ func handleAPIExport(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	}
 }
 
+func fetchRowValuesAsStrings(rows *sql.Rows, cols []string) ([]string, error) {
+	columnPointers := make([]interface{}, len(cols))
+	columnValues := make([]interface{}, len(cols))
+	for i := range columnValues {
+		columnPointers[i] = &columnValues[i]
+	}
+
+	if err := rows.Scan(columnPointers...); err != nil {
+		return nil, err
+	}
+
+	rowStr := make([]string, len(cols))
+	for i := range columnValues {
+		val := columnValues[i]
+		if val == nil {
+			rowStr[i] = ""
+		} else {
+			switch v := val.(type) {
+			case []byte:
+				rowStr[i] = string(v)
+			case time.Time:
+				rowStr[i] = v.Format(time.RFC3339)
+			case bool:
+				if v {
+					rowStr[i] = "true"
+				} else {
+					rowStr[i] = "false"
+				}
+			case float64:
+				// Avoid super long floats
+				strVal := fmt.Sprintf("%f", v)
+				rowStr[i] = strings.TrimRight(strings.TrimRight(strVal, "0"), ".")
+			default:
+				rowStr[i] = fmt.Sprintf("%v", v)
+			}
+		}
+	}
+	return rowStr, nil
+}
+
 func exportCSV(w http.ResponseWriter, rows *sql.Rows) {
 	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 	w.Header().Set("Content-Disposition", "attachment; filename=metrics_export.csv")
@@ -377,41 +452,25 @@ func exportCSV(w http.ResponseWriter, rows *sql.Rows) {
 	writer := csv.NewWriter(w)
 	defer writer.Flush()
 
-	header := []string{"ID", "Request ID", "Status", "Created At", "Duration (ms)", "Active", "Category", "Metadata"}
+	header := make([]string, len(tableColumns))
+	for i, col := range tableColumns {
+		header[i] = col.Name
+	}
+
 	if err := writer.Write(header); err != nil {
 		log.Printf("Export CSV header write error: %v", err)
 		return
 	}
 
+	cols, _ := rows.Columns()
 	for rows.Next() {
-		var id int
-		var reqID, status, category, metadata string
-		var t time.Time
-		var durationMs float64
-		var isActive bool
-
-		if err := rows.Scan(&id, &reqID, &status, &t, &durationMs, &isActive, &category, &metadata); err != nil {
+		rowStr, err := fetchRowValuesAsStrings(rows, cols)
+		if err != nil {
 			log.Printf("Export row scan error: %v", err)
 			return
 		}
 
-		activeStr := "false"
-		if isActive {
-			activeStr = "true"
-		}
-
-		row := []string{
-			strconv.Itoa(id),
-			reqID,
-			status,
-			t.Format(time.RFC3339),
-			fmt.Sprintf("%.2f", durationMs),
-			activeStr,
-			category,
-			metadata,
-		}
-
-		if err := writer.Write(row); err != nil {
+		if err := writer.Write(rowStr); err != nil {
 			log.Printf("Export CSV row write error: %v", err)
 			return
 		}
@@ -427,16 +486,17 @@ func exportExcel(w http.ResponseWriter, rows *sql.Rows) {
 	}()
 
 	sheetName := "Sheet1"
-	headers := []string{"ID", "Request ID", "Status", "Created At", "Duration (ms)", "Active", "Category", "Metadata"}
-
+	
 	// Set headers
-	for i, h := range headers {
+	for i, col := range tableColumns {
 		colName, err := excelize.ColumnNumberToName(i + 1)
 		if err != nil {
 			log.Printf("Excel column conversion error: %v", err)
 			return
 		}
-		f.SetCellValue(sheetName, colName+"1", h)
+		f.SetCellValue(sheetName, colName+"1", col.Name)
+		// Set a default col width
+		f.SetColWidth(sheetName, colName, colName, 20)
 	}
 
 	// Stylize Header
@@ -448,39 +508,19 @@ func exportExcel(w http.ResponseWriter, rows *sql.Rows) {
 		f.SetRowStyle(sheetName, 1, 1, style)
 	}
 
-	// Column Widths
-	widths := map[string]float64{"A": 10, "B": 40, "C": 15, "D": 25, "E": 15, "F": 10, "G": 15, "H": 50}
-	for col, width := range widths {
-		f.SetColWidth(sheetName, col, col, width)
-	}
-
 	rowIdx := 2
+	cols, _ := rows.Columns()
 	for rows.Next() {
-		var id int
-		var reqID, status, category, metadata string
-		var t time.Time
-		var durationMs float64
-		var isActive bool
-
-		if err := rows.Scan(&id, &reqID, &status, &t, &durationMs, &isActive, &category, &metadata); err != nil {
+		rowStr, err := fetchRowValuesAsStrings(rows, cols)
+		if err != nil {
 			log.Printf("Excel export row scan error: %v", err)
 			return
 		}
 
-		activeStr := "false"
-		if isActive {
-			activeStr = "true"
+		for i, val := range rowStr {
+			colName, _ := excelize.ColumnNumberToName(i + 1)
+			f.SetCellValue(sheetName, fmt.Sprintf("%s%d", colName, rowIdx), val)
 		}
-
-		f.SetCellValue(sheetName, fmt.Sprintf("A%d", rowIdx), id)
-		f.SetCellValue(sheetName, fmt.Sprintf("B%d", rowIdx), reqID)
-		f.SetCellValue(sheetName, fmt.Sprintf("C%d", rowIdx), status)
-		f.SetCellValue(sheetName, fmt.Sprintf("D%d", rowIdx), t.Format(time.RFC3339))
-		f.SetCellValue(sheetName, fmt.Sprintf("E%d", rowIdx), durationMs)
-		f.SetCellValue(sheetName, fmt.Sprintf("F%d", rowIdx), activeStr)
-		f.SetCellValue(sheetName, fmt.Sprintf("G%d", rowIdx), category)
-		f.SetCellValue(sheetName, fmt.Sprintf("H%d", rowIdx), metadata)
-
 		rowIdx++
 	}
 
@@ -496,7 +536,10 @@ func exportMarkdown(w http.ResponseWriter, rows *sql.Rows) {
 	w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
 	w.Header().Set("Content-Disposition", "attachment; filename=metrics_export.md")
 
-	headers := []string{"ID", "Request ID", "Status", "Created At", "Duration (ms)", "Active", "Category", "Metadata"}
+	headers := make([]string, len(tableColumns))
+	for i, col := range tableColumns {
+		headers[i] = col.Name
+	}
 
 	var sb strings.Builder
 	sb.WriteString("| ")
@@ -515,21 +558,12 @@ func exportMarkdown(w http.ResponseWriter, rows *sql.Rows) {
 	}
 	sb.Reset()
 
+	cols, _ := rows.Columns()
 	for rows.Next() {
-		var id int
-		var reqID, status, category, metadata string
-		var t time.Time
-		var durationMs float64
-		var isActive bool
-
-		if err := rows.Scan(&id, &reqID, &status, &t, &durationMs, &isActive, &category, &metadata); err != nil {
+		rowStr, err := fetchRowValuesAsStrings(rows, cols)
+		if err != nil {
 			log.Printf("Markdown export row scan error: %v", err)
 			return
-		}
-
-		activeStr := "false"
-		if isActive {
-			activeStr = "true"
 		}
 
 		esc := func(s string) string {
@@ -537,21 +571,12 @@ func exportMarkdown(w http.ResponseWriter, rows *sql.Rows) {
 		}
 
 		sb.WriteString("| ")
-		sb.WriteString(strconv.Itoa(id))
-		sb.WriteString(" | ")
-		sb.WriteString(esc(reqID))
-		sb.WriteString(" | ")
-		sb.WriteString(esc(status))
-		sb.WriteString(" | ")
-		sb.WriteString(esc(t.Format(time.RFC3339)))
-		sb.WriteString(" | ")
-		sb.WriteString(fmt.Sprintf("%.2f", durationMs))
-		sb.WriteString(" | ")
-		sb.WriteString(activeStr)
-		sb.WriteString(" | ")
-		sb.WriteString(esc(category))
-		sb.WriteString(" | ")
-		sb.WriteString(esc(metadata))
+		for i, val := range rowStr {
+			sb.WriteString(esc(val))
+			if i < len(rowStr)-1 {
+				sb.WriteString(" | ")
+			}
+		}
 		sb.WriteString(" |\n")
 
 		if _, err := w.Write([]byte(sb.String())); err != nil {
@@ -567,6 +592,13 @@ func exportPDF(w http.ResponseWriter, rows *sql.Rows) {
 	pdf.SetMargins(10, 10, 10)
 	pdf.SetAutoPageBreak(true, 10)
 
+	totalWidth := 277.0 // A4 landscape width (297) - margins (20)
+	colCount := len(tableColumns)
+	if colCount == 0 {
+		colCount = 1
+	}
+	baseWidth := totalWidth / float64(colCount)
+
 	pdf.SetHeaderFunc(func() {
 		pdf.SetFont("Arial", "B", 12)
 		pdf.Cell(0, 10, "Metrics Explorer Export")
@@ -574,14 +606,13 @@ func exportPDF(w http.ResponseWriter, rows *sql.Rows) {
 
 		pdf.SetFont("Arial", "B", 8)
 		pdf.SetFillColor(220, 220, 220)
-		headers := []string{"ID", "Request ID", "Status", "Created At", "Duration (ms)", "Active", "Category", "Metadata"}
-		widths := []float64{12, 62, 20, 38, 22, 12, 20, 91}
-		for i, h := range headers {
+		
+		for i, col := range tableColumns {
 			lnVal := 0
-			if i == len(headers)-1 {
+			if i == len(tableColumns)-1 {
 				lnVal = 1
 			}
-			pdf.CellFormat(widths[i], 7, h, "1", lnVal, "L", true, 0, "")
+			pdf.CellFormat(baseWidth, 7, col.Name, "1", lnVal, "L", true, 0, "")
 		}
 	})
 
@@ -594,25 +625,21 @@ func exportPDF(w http.ResponseWriter, rows *sql.Rows) {
 	pdf.AddPage()
 	pdf.SetFont("Arial", "", 8)
 
-	widths := []float64{12, 62, 20, 38, 22, 12, 20, 91}
 	fill := false
 	pdf.SetFillColor(245, 245, 245)
 
+	cols, _ := rows.Columns()
 	for rows.Next() {
-		var id int
-		var reqID, status, category, metadata string
-		var t time.Time
-		var durationMs float64
-		var isActive bool
-
-		if err := rows.Scan(&id, &reqID, &status, &t, &durationMs, &isActive, &category, &metadata); err != nil {
+		rowStr, err := fetchRowValuesAsStrings(rows, cols)
+		if err != nil {
 			log.Printf("PDF export row scan error: %v", err)
 			return
 		}
 
-		activeStr := "false"
-		if isActive {
-			activeStr = "true"
+		// rough truncation based on width (approx 2mm per char at 8pt, very rough)
+		maxChars := int(baseWidth / 1.5)
+		if maxChars < 5 {
+			maxChars = 5
 		}
 
 		trunc := func(s string, maxLen int) string {
@@ -622,14 +649,13 @@ func exportPDF(w http.ResponseWriter, rows *sql.Rows) {
 			return s
 		}
 
-		pdf.CellFormat(widths[0], 6, strconv.Itoa(id), "1", 0, "R", fill, 0, "")
-		pdf.CellFormat(widths[1], 6, trunc(reqID, 36), "1", 0, "L", fill, 0, "")
-		pdf.CellFormat(widths[2], 6, trunc(status, 12), "1", 0, "L", fill, 0, "")
-		pdf.CellFormat(widths[3], 6, t.Format(time.RFC3339), "1", 0, "L", fill, 0, "")
-		pdf.CellFormat(widths[4], 6, fmt.Sprintf("%.2f", durationMs), "1", 0, "R", fill, 0, "")
-		pdf.CellFormat(widths[5], 6, activeStr, "1", 0, "C", fill, 0, "")
-		pdf.CellFormat(widths[6], 6, trunc(category, 12), "1", 0, "L", fill, 0, "")
-		pdf.CellFormat(widths[7], 6, trunc(metadata, 60), "1", 1, "L", fill, 0, "")
+		for i, val := range rowStr {
+			lnVal := 0
+			if i == len(rowStr)-1 {
+				lnVal = 1
+			}
+			pdf.CellFormat(baseWidth, 6, trunc(val, maxChars), "1", lnVal, "L", fill, 0, "")
+		}
 
 		fill = !fill
 	}
